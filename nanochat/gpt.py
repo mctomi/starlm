@@ -126,8 +126,7 @@ class Deformer(nn.Module):
         pos0 = pos_floor.clamp(0, T - 1).long()
         pos1 = (pos0 + 1).clamp(0, T - 1)
         frac = pos - pos_floor
-
-        # x: [B, T, H, Dh], gather over dim=1 with index [B, T, H, Dh]
+        
         x0 = x.gather(1, pos0)
         x1 = x.gather(1, pos1)
 
