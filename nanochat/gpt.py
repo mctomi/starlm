@@ -70,36 +70,15 @@ class Deformer(nn.Module):
         return q, k, sq, sk
 
     def forward(self, x, kv_cache=None):
-        B, T, _ = x.shape
-
-        if (
-            kv_cache is not None
-            and T == 1
-            and not torch.is_grad_enabled()
-        ):
+        if kv_cache is not None:
             return self._forward_incremental(x, kv_cache)
 
-        if self.training:
-            return cp.checkpoint(
-                lambda x_: self._forward_full(x_, kv_cache),
-                x
-            )
-        else:
-            return self._forward_full(x, kv_cache)
+        return cp.checkpoint(self._forward_full, x)
 
-    def _forward_full(self, x, kv_cache):
+    def _forward_full(self, x):
         B, T, D = x.shape
 
         q, k, sq, sk = self._project(x)
-
-        if kv_cache is not None:
-            qv, kv, sqv, skv = kv_cache.insert_deformer(
-                self.layer_idx, q, k, sq, sk
-            )
-            q  = qv.transpose(1, 2).contiguous()
-            k  = kv.transpose(1, 2).contiguous()
-            sq = sqv.transpose(1, 2).contiguous()
-            sk = skv.transpose(1, 2).contiguous()
 
         B, Tk_total, H, Dh = q.shape
 
