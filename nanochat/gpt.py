@@ -18,10 +18,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
+
 
 @dataclass
 class GPTConfig:
@@ -38,76 +40,132 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3) # re-assemble
-    out = out.to(x.dtype) # ensure input/output dtypes match
-    return out
 
-class CausalSelfAttention(nn.Module):
+class Deformer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        dim = config.n_embd
+        h = config.n_head
         self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.h = h
+        self.dh = dim // h
+    
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
+        self.shift_q = nn.Linear(dim, dim, bias=False)
+        self.shift_k = nn.Linear(dim, dim, bias=False)
 
-        # Project the input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+    def _project(self, x):
+        B, T, _ = x.shape
+        H, Dh = self.h, self.dh
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+        q = self.q_proj(x).contiguous().view(B, T, H, Dh)
+        k = self.k_proj(x).contiguous().view(B, T, H, Dh)
+        q = norm(q)
+        k = norm(k)
 
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2) # number of queries in this forward pass
-        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+        sq = F.softplus(self.shift_q(x)).contiguous().view(B, T, H, Dh)
+        sk = F.softplus(self.shift_k(x)).contiguous().view(B, T, H, Dh)
+        return q, k, sq, sk
 
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+    def forward(self, x, kv_cache=None):
+        B, T, _ = x.shape
+
+        if (
+            kv_cache is not None
+            and T == 1
+            and not torch.is_grad_enabled()
+        ):
+            return self._forward_incremental(x, kv_cache)
+
+        if self.training:
+            return cp.checkpoint(
+                lambda x_: self._forward_full(x_, kv_cache),
+                x
+            )
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0: # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            return self._forward_full(x, kv_cache)
 
-        # Re-assemble the heads side by side and project back to residual stream
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+    def _forward_full(self, x, kv_cache):
+        B, T, D = x.shape
+
+        q, k, sq, sk = self._project(x)
+
+        if kv_cache is not None:
+            qv, kv, sqv, skv = kv_cache.insert_deformer(
+                self.layer_idx, q, k, sq, sk
+            )
+            q  = qv.transpose(1, 2).contiguous()
+            k  = kv.transpose(1, 2).contiguous()
+            sq = sqv.transpose(1, 2).contiguous()
+            sk = skv.transpose(1, 2).contiguous()
+
+        B, Tk_total, H, Dh = q.shape
+
+        t_idx = torch.arange(
+            Tk_total, device=q.device, dtype=q.dtype
+        ).view(1, Tk_total, 1, 1)
+
+        posq = (t_idx - sq).clamp(0, Tk_total - 1)
+        posk = (t_idx - sk).clamp(0, Tk_total - 1)
+
+        q_def = self._interp(q, posq)
+        k_def = self._interp(k, posk)
+
+        y_all = (q_def * k_def).reshape(B, Tk_total, D)
+        y = y_all[:, -T:, :]
         return y
+
+    def _forward_incremental(self, x, kv_cache):
+        B, T, D = x.shape
+        assert T == 1
+
+        q, k, sq, sk = self._project(x)
+
+        Q_all, K_all, SQ_all, SK_all = kv_cache.insert_deformer(
+            self.layer_idx, q, k, sq, sk
+        )
+
+        Q_all  = Q_all.transpose(1, 2).contiguous()
+        K_all  = K_all.transpose(1, 2).contiguous()
+        SQ_all = SQ_all.transpose(1, 2).contiguous()
+        SK_all = SK_all.transpose(1, 2).contiguous()
+
+        B, T_total, H, Dh = Q_all.shape
+
+        t_last = T_total - 1
+        t_idx_last = Q_all.new_tensor(t_last).view(1, 1, 1, 1)
+
+        sq_last = SQ_all[:, -1:, :, :]
+        sk_last = SK_all[:, -1:, :, :]
+
+        posq_last = (t_idx_last - sq_last).clamp(0, T_total - 1)
+        posk_last = (t_idx_last - sk_last).clamp(0, T_total - 1)
+
+        q_def_last = self._interp(Q_all, posq_last)
+        k_def_last = self._interp(K_all, posk_last)
+
+        y_last = (q_def_last * k_def_last).reshape(B, 1, D)
+        return y_last
+
+    def _interp(self, x, pos):
+        B, T, H, Dh = x.shape
+
+        pos0 = pos.floor().clamp(0, T - 1)
+        pos1 = (pos0 + 1).clamp(0, T - 1)
+        frac = pos - pos0
+
+        pos0 = pos0.long()
+        pos1 = pos1.long()
+
+        x = x.contiguous()
+        x0 = x.gather(1, pos0)
+        x1 = x.gather(1, pos1)
+
+        return x0 + (x1 - x0) * frac
+
+
 
 
 class MLP(nn.Module):
@@ -126,11 +184,11 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = Deformer(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, kv_cache):
+        x = x + self.attn(norm(x), kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -144,15 +202,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # To support meta device initialization, we init the rotary embeddings here, but it's fake
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's just over-compute them, but assert fail if we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
-        self.register_buffer("sin", sin, persistent=False)
+    
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -161,11 +211,6 @@ class GPT(nn.Module):
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-        # init the rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
@@ -244,19 +289,14 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            x = block(x, kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
