@@ -123,19 +123,15 @@ class Deformer(nn.Module):
         B, T, H, Dh = x.shape
 
         pos_floor = pos.floor()
-        pos0 = pos_floor.long().clamp(0, T - 1)
+        pos0 = pos_floor.clamp(0, T - 1).long()
         pos1 = (pos0 + 1).clamp(0, T - 1)
-
         frac = pos - pos_floor
 
-        b = torch.arange(B, device=x.device).view(B, 1, 1, 1)
-        h = torch.arange(H, device=x.device).view(1, 1, H, 1)
-        d = torch.arange(Dh, device=x.device).view(1, 1, 1, Dh)
+        # x: [B, T, H, Dh], gather over dim=1 with index [B, T, H, Dh]
+        x0 = x.gather(1, pos0)
+        x1 = x.gather(1, pos1)
 
-        x0 = x[b, pos0, h, d]
-        x1 = x[b, pos1, h, d]
         return x0 + (x1 - x0) * frac
-
 
 
 
