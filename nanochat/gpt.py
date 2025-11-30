@@ -49,10 +49,9 @@ class Deformer(nn.Module):
         self.layer_idx = layer_idx
         self.h = h
         self.dh = dim // h
-    
+
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
-
         self.shift_q = nn.Linear(dim, dim, bias=False)
         self.shift_k = nn.Linear(dim, dim, bias=False)
 
@@ -62,32 +61,30 @@ class Deformer(nn.Module):
 
         q = self.q_proj(x).contiguous().view(B, T, H, Dh)
         k = self.k_proj(x).contiguous().view(B, T, H, Dh)
+
         q = norm(q)
         k = norm(k)
 
         sq = F.softplus(self.shift_q(x)).contiguous().view(B, T, H, Dh)
         sk = F.softplus(self.shift_k(x)).contiguous().view(B, T, H, Dh)
+        
         return q, k, sq, sk
 
     def forward(self, x, kv_cache=None):
         if kv_cache is not None:
             return self._forward_incremental(x, kv_cache)
-
         return cp.checkpoint(self._forward_full, x)
 
     def _forward_full(self, x):
         B, T, D = x.shape
 
         q, k, sq, sk = self._project(x)
-
         B, Tk_total, H, Dh = q.shape
 
-        t_idx = torch.arange(
-            Tk_total, device=q.device, dtype=q.dtype
-        ).view(1, Tk_total, 1, 1)
+        t_idx = torch.arange(Tk_total, device=x.device, dtype=torch.float32).view(1, Tk_total, 1, 1)
 
-        posq = (t_idx - sq).clamp(0, Tk_total - 1)
-        posk = (t_idx - sk).clamp(0, Tk_total - 1)
+        posq = (t_idx - sq.float()).clamp(0, Tk_total - 1)
+        posk = (t_idx - sk.float()).clamp(0, Tk_total - 1)
 
         q_def = self._interp(q, posq)
         k_def = self._interp(k, posk)
@@ -98,50 +95,45 @@ class Deformer(nn.Module):
 
     def _forward_incremental(self, x, kv_cache):
         B, T, D = x.shape
-        assert T == 1
 
         q, k, sq, sk = self._project(x)
-
         Q_all, K_all, SQ_all, SK_all = kv_cache.insert_deformer(
             self.layer_idx, q, k, sq, sk
         )
 
-        Q_all  = Q_all.transpose(1, 2).contiguous()
-        K_all  = K_all.transpose(1, 2).contiguous()
+        Q_all = Q_all.transpose(1, 2).contiguous()
+        K_all = K_all.transpose(1, 2).contiguous()
         SQ_all = SQ_all.transpose(1, 2).contiguous()
         SK_all = SK_all.transpose(1, 2).contiguous()
 
         B, T_total, H, Dh = Q_all.shape
+        t_idx = torch.arange(T_total, device=Q_all.device, dtype=torch.float32).view(1, T_total, 1, 1)
 
-        t_last = T_total - 1
-        t_idx_last = Q_all.new_tensor(t_last).view(1, 1, 1, 1)
+        posq = (t_idx - SQ_all.float()).clamp(0, T_total - 1)
+        posk = (t_idx - SK_all.float()).clamp(0, T_total - 1)
 
-        sq_last = SQ_all[:, -1:, :, :]
-        sk_last = SK_all[:, -1:, :, :]
+        q_def = self._interp(Q_all, posq)
+        k_def = self._interp(K_all, posk)
 
-        posq_last = (t_idx_last - sq_last).clamp(0, T_total - 1)
-        posk_last = (t_idx_last - sk_last).clamp(0, T_total - 1)
-
-        q_def_last = self._interp(Q_all, posq_last)
-        k_def_last = self._interp(K_all, posk_last)
-
-        y_last = (q_def_last * k_def_last).reshape(B, 1, D)
+        y_all = (q_def * k_def).reshape(B, T_total, D)
+        y_last = y_all[:, -T:, :]
         return y_last
 
     def _interp(self, x, pos):
         B, T, H, Dh = x.shape
 
-        pos0 = pos.floor().clamp(0, T - 1)
+        pos_floor = pos.floor()
+        pos0 = pos_floor.long().clamp(0, T - 1)
         pos1 = (pos0 + 1).clamp(0, T - 1)
-        frac = pos - pos0
 
-        pos0 = pos0.long()
-        pos1 = pos1.long()
+        frac = pos - pos_floor
 
-        x = x.contiguous()
-        x0 = x.gather(1, pos0)
-        x1 = x.gather(1, pos1)
+        b = torch.arange(B, device=x.device).view(B, 1, 1, 1)
+        h = torch.arange(H, device=x.device).view(1, 1, H, 1)
+        d = torch.arange(Dh, device=x.device).view(1, 1, 1, Dh)
 
+        x0 = x[b, pos0, h, d]
+        x1 = x[b, pos1, h, d]
         return x0 + (x1 - x0) * frac
 
 
@@ -206,22 +198,6 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
-    # TODO: bump base theta more, e.g. 100K is more common more recently
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.transformer.wte.weight.device
-        # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
-        return cos, sin
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -268,8 +244,6 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
