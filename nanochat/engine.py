@@ -82,94 +82,57 @@ def use_calculator(expr):
 class KVCache:
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
         self.num_layers = num_layers
-        self.num_types  = 4  # Q, K, SQ, SK
-        self.batch_size = batch_size
-        self.num_heads  = num_heads
-        self.seq_len    = seq_len
-        self.head_dim   = head_dim
-
-        self.cache = None
+        self.batch = batch_size
+        self.heads = num_heads
+        self.seq = seq_len
+        self.dim = head_dim
+        
+        self.kv_cache = None
         self.pos = 0
 
     def reset(self):
         self.pos = 0
 
-    def get_pos(self):
-        return self.pos
-
-    def _lazy_init(self, dtype, device):
-        if self.cache is not None:
-            return
-
-        self.cache = torch.empty(
-            self.num_layers,
-            self.num_types,
-            self.batch_size,
-            self.num_heads,
-            self.seq_len,
-            self.head_dim,
-            dtype=dtype,
-            device=device,
-        )
-
-    def _expand_if_needed(self, t1, dtype, device):
-        if t1 <= self.cache.size(4):
-            return
-
-        new_len = (t1 + 1023) & ~1023
-        extra = new_len - self.cache.size(4)
-
-        shape = list(self.cache.shape)
-        shape[4] = extra
-
-        add = torch.empty(shape, dtype=dtype, device=device)
-        self.cache = torch.cat([self.cache, add], dim=4)
-
     def prefill(self, other):
-        assert self.cache is None, "cache not empty"
-        assert other.cache is not None, "other cache is empty"
-
-        dtype, device = other.cache.dtype, other.cache.device
-        self.cache = torch.empty(
-            self.num_layers,
-            self.num_types,
-            self.batch_size,
-            self.num_heads,
-            self.seq_len,
-            self.head_dim,
-            dtype=dtype,
-            device=device,
-        )
-
-        self.cache[:, :, :, :, :other.pos, :] = other.cache[:, :, :, :, :other.pos, :]
+        self.kv_cache = other.kv_cache.clone()
         self.pos = other.pos
 
-    def insert_deformer(self, layer_idx, q, k, sq, sk):
-        q = q.transpose(1, 2)   # [B,H,T,D]
-        k = k.transpose(1, 2)
-        sq = sq.transpose(1, 2)
-        sk = sk.transpose(1, 2)
+    def _lazy_init(self, dtype, device):
+        if self.kv_cache is None:
+            self.kv_cache = torch.empty(
+                self.num_layers,
+                2,
+                self.batch,
+                self.heads,
+                self.seq,
+                self.dim,
+                dtype=dtype,
+                device=device
+            )
 
+    def insert_deformer(self, layer_idx, q, k):
         B, H, T_add, D = q.shape
-        t0, t1 = self.pos, self.pos + T_add
+        t0 = self.pos
+        t1 = t0 + T_add
 
         self._lazy_init(q.dtype, q.device)
-        self._expand_if_needed(t1, q.dtype, q.device)
 
-        self.cache[layer_idx, 0, :, :, t0:t1] = q
-        self.cache[layer_idx, 1, :, :, t0:t1] = k
-        self.cache[layer_idx, 2, :, :, t0:t1] = sq
-        self.cache[layer_idx, 3, :, :, t0:t1] = sk
+        if t1 > self.seq:
+            raise RuntimeError(
+                f"Exceeded KVCache capacity: needed {t1}, max {self.seq}"
+            )
 
-        Q  = self.cache[layer_idx, 0, :, :, :t1]
-        Kd = self.cache[layer_idx, 1, :, :, :t1]
-        SQ = self.cache[layer_idx, 2, :, :, :t1]
-        SK = self.cache[layer_idx, 3, :, :, :t1]
+        self.kv_cache[layer_idx, 0, :, :, t0:t1] = q
+        self.kv_cache[layer_idx, 1, :, :, t0:t1] = k
 
         if layer_idx == self.num_layers - 1:
             self.pos = t1
 
-        return Q, Kd, SQ, SK
+        return (
+            self.kv_cache[layer_idx, 0, :, :, :t1],
+            self.kv_cache[layer_idx, 1, :, :, :t1],
+            t0
+        )
 
 
 # -----------------------------------------------------------------------------

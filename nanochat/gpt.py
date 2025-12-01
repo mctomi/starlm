@@ -34,8 +34,6 @@ def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
 
-
-
 class Deformer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -62,69 +60,75 @@ class Deformer(nn.Module):
 
         sq = F.softplus(self.shift_q(x)).contiguous().view(B, T, H, Dh)
         sk = F.softplus(self.shift_k(x)).contiguous().view(B, T, H, Dh)
-        
+
         return q, k, sq, sk
 
     def forward(self, x, kv_cache=None):
         if kv_cache is not None:
             return self._forward_incremental(x, kv_cache)
+
         return cp.checkpoint(self._forward_full, x)
 
     def _forward_full(self, x):
         B, T, D = x.shape
 
         q, k, sq, sk = self._project(x)
-        B, Tk_total, H, Dh = q.shape
 
-        t_idx = torch.arange(Tk_total, device=x.device, dtype=torch.float32).view(1, Tk_total, 1, 1)
+        t_idx = torch.arange(T, device=x.device, dtype=torch.float32).view(1, T, 1, 1)
 
-        posq = (t_idx - sq.float()).clamp(0, Tk_total - 1)
-        posk = (t_idx - sk.float()).clamp(0, Tk_total - 1)
+        posq = t_idx - sq
+        posq = torch.maximum(posq, torch.zeros_like(posq))
+        posq = torch.minimum(posq, t_idx)
+
+        posk = t_idx - sk
+        posk = torch.maximum(posk, torch.zeros_like(posk))
+        posk = torch.minimum(posk, t_idx)
 
         q_def = self._interp(q, posq)
         k_def = self._interp(k, posk)
 
-        y_all = (q_def * k_def).reshape(B, Tk_total, D)
-        y = y_all[:, -T:, :]
+        y = (q_def * k_def).reshape(B, T, D)
+
         return y
 
     def _forward_incremental(self, x, kv_cache):
         B, T, D = x.shape
-
         q, k, sq, sk = self._project(x)
-        Q_all, K_all, SQ_all, SK_all = kv_cache.insert_deformer(
-            self.layer_idx, q, k, sq, sk
-        )
 
-        Q_all = Q_all.transpose(1, 2).contiguous()
-        K_all = K_all.transpose(1, 2).contiguous()
-        SQ_all = SQ_all.transpose(1, 2).contiguous()
-        SK_all = SK_all.transpose(1, 2).contiguous()
+        q_t = q.transpose(1, 2)  
+        k_t = k.transpose(1, 2)
 
-        B, T_total, H, Dh = Q_all.shape
-        t_idx = torch.arange(T_total, device=Q_all.device, dtype=torch.float32).view(1, T_total, 1, 1)
+        Q_all, K_all, T_prev = kv_cache.insert_deformer(self.layer_idx, q_t, k_t)
 
-        posq = (t_idx - SQ_all.float()).clamp(0, T_total - 1)
-        posk = (t_idx - SK_all.float()).clamp(0, T_total - 1)
+        t_idx = torch.arange(T_prev, T_prev + T, device=x.device, dtype=torch.float32).view(1, T, 1, 1)
+
+        posq = t_idx - sq
+        posq = torch.maximum(posq, torch.zeros_like(posq))
+        posq = torch.minimum(posq, t_idx)
+
+        posk = t_idx - sk
+        posk = torch.maximum(posk, torch.zeros_like(posk))
+        posk = torch.minimum(posk, t_idx)
 
         q_def = self._interp(Q_all, posq)
         k_def = self._interp(K_all, posk)
 
-        y_all = (q_def * k_def).reshape(B, T_total, D)
-        y_last = y_all[:, -T:, :]
-        return y_last
+        y = (q_def * k_def).reshape(B, T, D)
+        return y
 
     def _interp(self, x, pos):
-        B, T, H, Dh = x.shape
+        B, T_x, H, Dh = x.shape
 
         pos_floor = pos.floor()
-        pos0 = pos_floor.clamp(0, T - 1).long()
-        pos1 = (pos0 + 1).clamp(0, T - 1)
+
+        pos0 = pos_floor.clamp(0, T_x - 1).long()
+        pos1 = (pos0 + 1).clamp(0, T_x - 1)
+
         frac = pos - pos_floor
-        
+
         x0 = x.gather(1, pos0)
         x1 = x.gather(1, pos1)
-
+        
         return x0 + (x1 - x0) * frac
 
 
