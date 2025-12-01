@@ -1,15 +1,10 @@
-"""
-GPT model (rewrite, a lot simpler)
-Notable features:
-- rotary embeddings (and no positional embeddings)
-- QK norm
-- untied weights for token embedding and lm_head
-- relu^2 activation in MLP
-- norm after token embedding
-- no learnable params in rmsnorm
-- no bias in linear layers
-- Group-Query Attention (GQA) support for more efficient inference
-"""
+# This file is part of a modified version of a project originally licensed under MIT.
+# 
+# Copyright (c) 2025 mctomi
+#
+# Licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
+# You should have received a copy of the AGPL License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
 
 import math
 from functools import partial
