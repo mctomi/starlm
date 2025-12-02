@@ -1,9 +1,18 @@
 # **StarLM — Deformer Architecture**
 
-StarLM is introducing the **Deformer**, a **linear-time (O(T))**, fully **parallel** architecture for efficient sequence processing.  
-Instead of relying on quadratic self-attention, the Deformer shifts and re-samples each token’s representation across the sequence. Every head and embedding dimension can **read from a different token position**, enabling flexible cross-token communication with minimal computational cost.
+StarLM introduces the **Deformer**, a **linear-time (O(T))**, fully **parallel** alternative to quadratic self-attention for sequence modeling.
 
-Because all operations are vectorized, the Deformer supports **O(T) training and inference**, providing fast temporal alignment and feature mixing at scale. This makes it a lightweight and efficient component for high-throughput sequence models.
+Instead of computing dense attention over all pairs of tokens, the Deformer **deforms** the sequence: each head and embedding dimension learns a continuous shift over time and **re-samples features from other token positions**. This lets different dimensions **read from different timesteps** while keeping the computation simple and highly vectorized.
+
+Because everything is implemented with standard tensor ops (projections + interpolation), the Deformer offers:
+
+- **Linear-time training (O(T))** with respect to sequence length, without the O(T²) cost of self-attention.
+- **O(1) per-token compute with respect to context length** during autoregressive decoding: generation cost does not grow as the context gets longer.
+- **Fully parallel encoding** over all tokens in a sequence (no recurrence or scan needed).
+- **Rich cross-token communication**, since each head/dimension can independently select which past positions to read from.
+- **Lightweight, hardware-friendly implementation** built from dense layers, normalization, and gathers—no custom kernels or attention softmax required.
+
+In practice, this makes the Deformer a fast, scalable building block for high-throughput sequence models, preserving much of the flexibility of attention while avoiding its quadratic time complexity.
 
 
 ## License
