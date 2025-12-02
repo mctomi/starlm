@@ -80,9 +80,8 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 class KVCache:
-
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
-        self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
+        self.kv_shape = (num_layers, 2, batch_size, seq_len, num_heads, head_dim)
         self.kv_cache = None
         self.pos = 0
 
@@ -98,36 +97,31 @@ class KVCache:
 
     def _lazy_init(self, dtype, device):
         if self.kv_cache is None:
-            self.kv_cache = torch.empty(
-                self.kv_shape,
-                dtype=dtype,
-                device=device
-            )
+            self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
 
     def insert_deformer(self, layer_idx, q, k):
-
-        B, H, T_add, D = q.shape
+        B, T_add, H, D = q.shape
         t0 = self.pos
         t1 = t0 + T_add
 
         self._lazy_init(q.dtype, q.device)
 
-        if t1 > self.kv_shape[4]:
-            raise RuntimeError(
-                f"KVCache capacity exceeded: need {t1}, max {self.kv_shape[4]}"
-            )
+        if t1 > self.kv_shape[3]:
+            raise RuntimeError(f"KVCache capacity exceeded: need {t1}, max {self.kv_shape[3]}")
 
-        self.kv_cache[layer_idx, 0, :, :, t0:t1] = q
-        self.kv_cache[layer_idx, 1, :, :, t0:t1] = k
+        self.kv_cache[layer_idx, 0, :, t0:t1, :, :] = q
+        self.kv_cache[layer_idx, 1, :, t0:t1, :, :] = k
 
         if layer_idx == self.kv_shape[0] - 1:
             self.pos = t1
 
         return (
-            self.kv_cache[layer_idx, 0, :, :, :t1], 
-            self.kv_cache[layer_idx, 1, :, :, :t1],  
-            t0                                      
+            self.kv_cache[layer_idx, 0, :, :t1, :, :],
+            self.kv_cache[layer_idx, 1, :, :t1, :, :],
+            t0,
         )
+
+
 
 
 # -----------------------------------------------------------------------------
