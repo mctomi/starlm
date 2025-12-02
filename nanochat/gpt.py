@@ -64,6 +64,7 @@ class Deformer(nn.Module):
         return q, k, sq, sk
 
     def forward(self, x, kv_cache=None):
+        
         if kv_cache is not None:
             return self._forward_incremental(x, kv_cache)
 
