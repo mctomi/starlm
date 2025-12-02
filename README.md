@@ -11,6 +11,7 @@ Because everything is implemented with standard tensor ops (projections + interp
 - **Fully parallel encoding** over all tokens in a sequence (no recurrence or scan needed).
 - **Rich cross-token communication**, since each head/dimension can independently select which past positions to read from.
 - **Lightweight, hardware-friendly implementation** built from dense layers, normalization, and gathers—no custom kernels or attention softmax required.
+- **Inherently position-aware**, using absolute time indices plus learned shifts to read from different timesteps, so it can model order without relying solely on external positional encodings.
 
 In practice, this makes the Deformer a fast, scalable building block for high-throughput sequence models, preserving much of the flexibility of attention while avoiding its quadratic time complexity.
 
