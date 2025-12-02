@@ -80,18 +80,21 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 class KVCache:
+    """
+    Same interface as your previous cache,
+    but adapted for the Deformer (Q/K instead of K/V).
+    """
+
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
-        self.num_layers = num_layers
-        self.batch = batch_size
-        self.heads = num_heads
-        self.seq = seq_len
-        self.dim = head_dim
-        
+        self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
         self.pos = 0
 
     def reset(self):
         self.pos = 0
+
+    def get_pos(self):
+        return self.pos
 
     def prefill(self, other):
         self.kv_cache = other.kv_cache.clone()
@@ -100,38 +103,34 @@ class KVCache:
     def _lazy_init(self, dtype, device):
         if self.kv_cache is None:
             self.kv_cache = torch.empty(
-                self.num_layers,
-                2,
-                self.batch,
-                self.heads,
-                self.seq,
-                self.dim,
+                self.kv_shape,
                 dtype=dtype,
                 device=device
             )
 
     def insert_deformer(self, layer_idx, q, k):
+
         B, H, T_add, D = q.shape
         t0 = self.pos
         t1 = t0 + T_add
 
         self._lazy_init(q.dtype, q.device)
 
-        if t1 > self.seq:
+        if t1 > self.kv_shape[4]:
             raise RuntimeError(
-                f"Exceeded KVCache capacity: needed {t1}, max {self.seq}"
+                f"KVCache capacity exceeded: need {t1}, max {self.kv_shape[4]}"
             )
 
         self.kv_cache[layer_idx, 0, :, :, t0:t1] = q
         self.kv_cache[layer_idx, 1, :, :, t0:t1] = k
 
-        if layer_idx == self.num_layers - 1:
+        if layer_idx == self.kv_shape[0] - 1:
             self.pos = t1
 
         return (
-            self.kv_cache[layer_idx, 0, :, :, :t1],
-            self.kv_cache[layer_idx, 1, :, :, :t1],
-            t0
+            self.kv_cache[layer_idx, 0, :, :, :t1], 
+            self.kv_cache[layer_idx, 1, :, :, :t1],  
+            t0                                      
         )
 
 
