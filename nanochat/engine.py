@@ -80,10 +80,6 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 class KVCache:
-    """
-    Same interface as your previous cache,
-    but adapted for the Deformer (Q/K instead of K/V).
-    """
 
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
