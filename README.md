@@ -15,6 +15,9 @@ Because everything is implemented with standard tensor ops (projections + interp
 
 In practice, this makes the Deformer a fast, scalable building block for high-throughput sequence models, preserving much of the flexibility of attention while avoiding its quadratic time complexity.
 
+## 📄 File reference  
+You can view the code here:  
+[gpt.py — line 37](https://github.com/mctomi/starlm/blob/65043b5b0c319ad25029da3b16f8f5914d084fb9/nanochat/gpt.py#L37)  
 
 ## License
 
