@@ -1,21 +1,11 @@
 # **StarLM — Deformer Architecture**
 
-StarLM introduces the **Deformer**, a **linear-time (O(T))**, fully **parallel** alternative to quadratic self-attention for sequence modeling.
+I developed the *deformer*: a form of linear attention where each dimension selects and learns a temporal shift, combining tokens through linear interpolation. It outperforms transformers as the context window grows larger, both in computational speed and learning efficiency. Because the shift is token-dependent, the model becomes highly adaptive, allowing each dimension to choose a different shift to extract information from different tokens. It inherently encodes positional information without requiring RoPE or positional embeddings, and without increasing the parameter count.
 
-Instead of computing dense attention over all pairs of tokens, the Deformer **deforms** the sequence: each head and embedding dimension learns a continuous shift over time and **re-samples features from other token positions**. This lets different dimensions **read from different timesteps** while keeping the computation simple and highly vectorized.
+It supports O(1) inference and O(n) parallel training while remaining mathematically simple.
 
-Because everything is implemented with standard tensor ops (projections + interpolation), the Deformer offers:
 
-- **Linear-time training (O(T))** with respect to sequence length, without the O(T²) cost of self-attention.
-- **O(1) per-token compute with respect to context length** during autoregressive decoding: generation cost does not grow as the context gets longer.
-- **Fully parallel encoding** over all tokens in a sequence (no recurrence or scan needed).
-- **Rich cross-token communication**, since each head/dimension can independently select which past positions to read from.
-- **Lightweight, hardware-friendly implementation** built from dense layers, normalization, and gathers—no custom kernels or attention softmax required.
-- **Inherently position-aware**, using absolute time indices plus learned shifts to read from different timesteps, so it can model order without relying solely on external positional encodings.
-
-In practice, this makes the Deformer a fast, scalable building block for high-throughput sequence models, preserving much of the flexibility of attention while avoiding its quadratic time complexity.
-
-## 📄 File reference  
+## File reference  
 You can view the code here:  
 [gpt.py — line 37](https://github.com/mctomi/starlm/blob/65043b5b0c319ad25029da3b16f8f5914d084fb9/nanochat/gpt.py#L37)  
 
