@@ -39,32 +39,26 @@ class Deformer(nn.Module):
         super().__init__()
         dim = config.n_embd
         h = config.n_head
-        self.layer_idx = layer_idx
         self.h = h
         self.dh = dim // h
 
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.shift_q = nn.Linear(dim, dim, bias=False)
-        self.shift_k = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.shift_v = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
 
     def _project(self, x):
         B, T, _ = x.shape
         H, Dh = self.h, self.dh
 
-        q = self.q_proj(x).view(B, T, H, Dh)
-        k = self.k_proj(x).view(B, T, H, Dh)
+        v = self.v_proj(x).view(B, T, H, Dh)
 
-        q = norm(q)
-        k = norm(k)
+        v = norm(v)
 
-        sq = F.softplus(self.shift_q(x)).view(B, T, H, Dh)
-        sk = F.softplus(self.shift_k(x)).view(B, T, H, Dh)
+        sv = F.softplus(self.shift_v(x)).view(B, T, H, Dh)
 
-        return q, k, sq, sk
+        return v,sv
 
     def forward(self, x, kv_cache=None):
-        
         if kv_cache is not None:
             return self._forward_incremental(x, kv_cache)
 
@@ -75,43 +69,40 @@ class Deformer(nn.Module):
 
     def _forward_full(self, x):
         B, T, D = x.shape
-        q, k, sq, sk = self._project(x)
+        v,sv = self._project(x)
 
         t_idx = torch.arange(T, device=x.device, dtype=x.dtype).view(1, T, 1, 1)
-        zero = torch.zeros_like(sq)
+        zero = torch.zeros_like(sv)
 
-        posq = torch.maximum(t_idx - sq, zero)
-        posq = torch.minimum(posq, t_idx)
+        posv = torch.maximum(t_idx - sv, zero)
+        posv = torch.minimum(posv, t_idx)
 
-        posk = torch.maximum(t_idx - sk, zero)
-        posk = torch.minimum(posk, t_idx)
+        v_def = self._interp(v, posv)
 
-        q_def = self._interp(q, posq)
-        k_def = self._interp(k, posk)
+        out =  v_def.reshape(B, T, D)
 
-        return (q_def * k_def).reshape(B, T, D)
+        return self.out_proj(out)
 
     def _forward_incremental(self, x, kv_cache):
         B, T, D = x.shape
-        q, k, sq, sk = self._project(x)
+        v, sv = self._project(x)
 
-        Q_all, K_all, T_prev = kv_cache.insert_deformer(self.layer_idx, q, k)
+        V_all, T_prev = kv_cache.insert_deformer(self.layer_idx, v)
 
         t_idx = torch.arange(T_prev, T_prev + T, device=x.device, dtype=x.dtype)
         t_idx = t_idx.view(1, T, 1, 1)
 
-        zero = torch.zeros_like(sq)
+        zero = torch.zeros_like(sv)
 
-        posq = torch.maximum(t_idx - sq, zero)
-        posq = torch.minimum(posq, t_idx)
+        posv = torch.maximum(t_idx - sv, zero)
+        posv = torch.minimum(posv, t_idx)
 
-        posk = torch.maximum(t_idx - sk, zero)
-        posk = torch.minimum(posk, t_idx)
+        v_def = self._interp(V_all, posv)
 
-        q_def = self._interp(Q_all, posq)
-        k_def = self._interp(K_all, posk)
+        out = v_def.reshape(B, T, D)
 
-        return (q_def * k_def).reshape(B, T, D)
+        return self.out_proj(out)
+
 
     def _interp(self, x, pos):
         B, T_x, H, Dh = x.shape
@@ -126,6 +117,7 @@ class Deformer(nn.Module):
         x1 = x.gather(1, pos1)
 
         return x0 + (x1 - x0) * frac
+
 
 
 
@@ -146,11 +138,9 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = Deformer(config, layer_idx)
-        self.mlp = MLP(config)
 
     def forward(self, x, kv_cache):
         x = x + self.attn(norm(x), kv_cache)
-        x = x + self.mlp(norm(x))
         return x
 
 
@@ -170,8 +160,6 @@ class GPT(nn.Module):
         # zero out classifier weights
         torch.nn.init.zeros_(self.lm_head.weight)
         # zero out c_proj weights in all blocks
-        for block in self.transformer.h:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
