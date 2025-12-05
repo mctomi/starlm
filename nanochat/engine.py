@@ -80,10 +80,8 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 class KVCache:
-  
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
-     
-        self.kv_shape = (num_layers, 2, batch_size, seq_len, num_heads, head_dim)
+        self.kv_shape = (num_layers, 1, batch_size, seq_len, num_heads, head_dim)
         self.kv_cache = None
         self.pos = 0
 
@@ -94,22 +92,17 @@ class KVCache:
         return self.pos
 
     def prefill(self, other):
-      
-        assert self.kv_cache is None, "Cannot prefill a non-empty KV cache"
-        assert other.kv_cache is not None, "Cannot prefill with a None KV cache"
-        for ix, (dim1, dim2) in enumerate(zip(self.kv_shape, other.kv_shape)):
-           
-            if ix in [0, 1, 4, 5]:
-              
-                assert dim1 == dim2, f"Dim {ix} mismatch: {dim1} != {dim2}"
-            elif ix == 2:
-             
-                assert dim1 == dim2 or dim2 == 1, f"Batch dim mismatch: {dim1} != {dim2}"
-            elif ix == 3:
-              
-                assert dim1 >= dim2, f"Seq len mismatch: {dim1} < {dim2}"
+        assert self.kv_cache is None
+        assert other.kv_cache is not None
 
-     
+        for ix, (dim1, dim2) in enumerate(zip(self.kv_shape, other.kv_shape)):
+            if ix in [0, 1, 4, 5]:
+                assert dim1 == dim2
+            elif ix == 2:
+                assert dim1 == dim2 or dim2 == 1
+            elif ix == 3:
+                assert dim1 >= dim2
+
         dtype, device = other.kv_cache.dtype, other.kv_cache.device
 
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
@@ -117,35 +110,32 @@ class KVCache:
 
         self.pos = other.pos
 
-    def insert_deformer(self, layer_idx, q, k):
-
+    def insert_deformer(self, layer_idx, v):
         if self.kv_cache is None:
-            self.kv_cache = torch.empty(self.kv_shape, dtype=q.dtype, device=q.device)
+            self.kv_cache = torch.empty(self.kv_shape, dtype=v.dtype, device=v.device)
 
-        B, T_add, H, D = q.size()
+        B, T_add, H, D = v.size()
         t0, t1 = self.pos, self.pos + T_add
 
         if t1 > self.kv_cache.size(3):
-            t_needed = t1 + 1024  
-            t_needed = (t_needed + 1023) & ~1023 
+            t_needed = t1 + 1024
+            t_needed = (t_needed + 1023) & ~1023
 
-            additional_shape = list(self.kv_cache.shape)
-            additional_shape[3] = t_needed - self.kv_cache.size(3)
-            additional_cache = torch.empty(additional_shape, dtype=q.dtype, device=q.device)
+            new_shape = list(self.kv_cache.shape)
+            new_shape[3] = t_needed - self.kv_cache.size(3)
+            extra = torch.empty(new_shape, dtype=v.dtype, device=v.device)
 
-            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=3).contiguous()
+            self.kv_cache = torch.cat([self.kv_cache, extra], dim=3).contiguous()
             self.kv_shape = self.kv_cache.shape
 
-        self.kv_cache[layer_idx, 0, :, t0:t1, :, :] = q
-        self.kv_cache[layer_idx, 1, :, t0:t1, :, :] = k
+        self.kv_cache[layer_idx, 0, :, t0:t1, :, :] = v
 
-        Q_all = self.kv_cache[layer_idx, 0, :, :t1, :, :]
-        K_all = self.kv_cache[layer_idx, 1, :, :t1, :, :]
+        V_all = self.kv_cache[layer_idx, 0, :, :t1, :, :]
 
         if layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
 
-        return Q_all, K_all, t0
+        return V_all, t0
 
 
 
