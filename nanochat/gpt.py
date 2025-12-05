@@ -42,6 +42,8 @@ class Deformer(nn.Module):
         self.h = h
         self.dh = dim // h
 
+        self.layer_idx = layer_idx
+
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.shift_v = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
@@ -119,21 +121,6 @@ class Deformer(nn.Module):
         return x0 + (x1 - x0) * frac
 
 
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -159,7 +146,11 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # zero out classifier weights
         torch.nn.init.zeros_(self.lm_head.weight)
+
         # zero out c_proj weights in all blocks
+        for block in self.transformer.h:
+            torch.nn.init.zeros_(block.attn.out_proj.weight)
+            
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
