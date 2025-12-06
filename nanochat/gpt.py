@@ -45,6 +45,7 @@ class Deformer(nn.Module):
         self.layer_idx = layer_idx
 
         self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.g_proj = nn.Linear(dim, dim, bias=False)
         self.shift_v = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
@@ -58,7 +59,9 @@ class Deformer(nn.Module):
 
         sv = F.softplus(self.shift_v(x)).view(B, T, H, Dh)
 
-        return v,sv
+        g = torch.sigmoid(self.g_proj(x).view(B, T, H, Dh))        
+
+        return v,sv,g
 
     def forward(self, x, kv_cache=None):
         if kv_cache is not None:
@@ -71,7 +74,8 @@ class Deformer(nn.Module):
 
     def _forward_full(self, x):
         B, T, D = x.shape
-        v,sv = self._project(x)
+
+        v,sv,g = self._project(x)
 
         t_idx = torch.arange(T, device=x.device, dtype=x.dtype).view(1, T, 1, 1)
         zero = torch.zeros_like(sv)
@@ -81,13 +85,16 @@ class Deformer(nn.Module):
 
         v_def = self._interp(v, posv)
 
-        out =  v_def.reshape(B, T, D)
+        mix = v_def * g
+
+        out = mix.reshape(B, T, D)
 
         return self.out_proj(out)
 
     def _forward_incremental(self, x, kv_cache):
         B, T, D = x.shape
-        v, sv = self._project(x)
+
+        v,sv,g = self._project(x)
 
         V_all, T_prev = kv_cache.insert_deformer(self.layer_idx, v)
 
@@ -101,7 +108,9 @@ class Deformer(nn.Module):
 
         v_def = self._interp(V_all, posv)
 
-        out = v_def.reshape(B, T, D)
+        mix = v_def * g
+
+        out = mix.reshape(B, T, D)
 
         return self.out_proj(out)
 
